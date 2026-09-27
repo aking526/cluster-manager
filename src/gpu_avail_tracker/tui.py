@@ -25,10 +25,10 @@ def _safe_display(value: str, limit: int = 120) -> str:
     return value[: limit - 1] + "…" if len(value) > limit else value
 
 
-def _memory(used: int | None, total: int | None) -> str:
+def _memory(used: int | None, total: int | None, used_width: int) -> Text:
     if used is None or total is None:
-        return "N/A"
-    return f"{used}/{total}"
+        return Text("N/A")
+    return Text(f"{used:>{used_width}}/{total}")
 
 
 class GPUTrackerApp(App[None]):
@@ -130,6 +130,15 @@ class GPUTrackerApp(App[None]):
 
     def _render(self) -> None:
         table = self.query_one("#gpus", DataTable)
+        used_width = max(
+            (
+                len(str(gpu.memory_used_mib))
+                for state in self.states.values()
+                for gpu in (state.snapshot.gpus if state.snapshot else ())
+                if gpu.memory_used_mib is not None
+            ),
+            default=1,
+        )
         selected_id = (
             self._row_ids[table.cursor_row]
             if 0 <= table.cursor_row < len(self._row_ids)
@@ -165,7 +174,7 @@ class GPUTrackerApp(App[None]):
                     str(gpu.index),
                     _safe_display(gpu.name, 50),
                     Text(status, style=color),
-                    _memory(gpu.memory_used_mib, gpu.memory_total_mib),
+                    _memory(gpu.memory_used_mib, gpu.memory_total_mib, used_width),
                     str(len(gpu.processes)) if not state.error else "—",
                     checked,
                 )

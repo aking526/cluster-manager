@@ -49,7 +49,12 @@ class TuiTests(unittest.IsolatedAsyncioTestCase):
                 self.assertEqual(table.get_row_at(0)[0].plain, "lab / gpu01")
                 self.assertEqual(table.get_row_at(0)[1:], ["", "", "", "", ""])
                 self.assertEqual(table.get_row_at(1)[2].plain, "In use")
-                self.assertEqual(table.get_row_at(1)[3], "2048/81920")
+                self.assertEqual(table.get_row_at(1)[3].plain, "2048/81920")
+                self.assertEqual(table.get_row_at(2)[3].plain, "   0/81920")
+                self.assertEqual(
+                    table.get_row_at(1)[3].plain.index("/"),
+                    table.get_row_at(2)[3].plain.index("/"),
+                )
                 self.assertEqual(table.get_row_at(2)[2].plain, "Idle")
 
                 table.move_cursor(row=2)
@@ -74,9 +79,10 @@ class TuiTests(unittest.IsolatedAsyncioTestCase):
         )
 
         async def fake_query(target: Target) -> Snapshot:
+            used = 40000 if target.name == "gpu01" else 0
             return Snapshot(
                 target,
-                (Gpu(0, f"GPU-{target.name}", "NVIDIA A100", 81920, 0, ()),),
+                (Gpu(0, f"GPU-{target.name}", "NVIDIA A100", 81920, used, ()),),
                 datetime.now(timezone.utc),
             )
 
@@ -90,3 +96,5 @@ class TuiTests(unittest.IsolatedAsyncioTestCase):
                 self.assertEqual(table.get_row_at(1)[0], "0")
                 self.assertEqual(table.get_row_at(2)[0].plain, "lab-b / gpu02")
                 self.assertEqual(table.get_row_at(3)[0], "0")
+                self.assertEqual(table.get_row_at(1)[3].plain, "40000/81920")
+                self.assertEqual(table.get_row_at(3)[3].plain, "    0/81920")
