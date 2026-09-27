@@ -46,7 +46,7 @@ Before running the TUI, verify each host's fingerprint through your lab's truste
 .venv/bin/gpu-avail
 ```
 
-Use `--env-file path/to/.env` to load a different file. Each host has a heading above its GPU rows. Press `r` to refresh, arrow keys to select a host or GPU, and `q` to quit. The app queries once at launch. Set `GPU_TRACKER_REFRESH_SECONDS` to `10` or higher to add automatic refresh; `0` keeps manual mode. Refreshes never overlap, and at most four hosts are queried at once.
+Use `--env-file path/to/.env` to load a different file. Each host has a heading above its GPU rows. Press `r` to refresh, arrow keys to select a host or GPU, and `q` to quit. The app queries once at launch. The summary shows when the last full refresh finished; selecting a host shows its last successful check. Set `GPU_TRACKER_REFRESH_SECONDS` to `10` or higher to add automatic refresh; `0` keeps manual mode. Refreshes never overlap, and at most four hosts are queried at once.
 
 **Idle** means `nvidia-smi` returned no active compute processes for that GPU at the time of the query. It does not mean that a scheduler has released the GPU or that no graphics or other GPU work exists. A failed host is **Unknown**, and any previously displayed process list is marked stale. If a process exits between the NVIDIA query and `ps`, its owner appears as **Unknown** while its GPU remains **In use**.
 

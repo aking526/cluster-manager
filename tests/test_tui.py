@@ -13,7 +13,7 @@ from gpu_avail_tracker.probe import Gpu, GpuProcess, ProbeError, Snapshot
 @unittest.skipUnless(importlib.util.find_spec("textual"), "Textual is not installed")
 class TuiTests(unittest.IsolatedAsyncioTestCase):
     async def test_launch_manual_refresh_and_stale_error(self) -> None:
-        from textual.widgets import DataTable
+        from textual.widgets import DataTable, Static
 
         from gpu_avail_tracker.tui import GPUTrackerApp
 
@@ -44,18 +44,21 @@ class TuiTests(unittest.IsolatedAsyncioTestCase):
                 self.assertEqual(table.row_count, 3)
                 self.assertEqual(
                     [column.label.plain for column in table.columns.values()],
-                    ["GPU", "Model", "Status", "Memory (MiB)", "Procs", "Checked"],
+                    ["GPU", "Model", "Status", "Memory (MiB)", "Procs"],
                 )
                 self.assertEqual(table.get_row_at(0)[0].plain, "lab / gpu01")
-                self.assertEqual(table.get_row_at(0)[1:], ["", "", "", "", ""])
+                self.assertEqual(table.get_row_at(0)[1:], ["", "", "", ""])
                 self.assertEqual(table.get_row_at(1)[2].plain, "In use")
-                self.assertEqual(table.get_row_at(1)[3].plain, "2048/81920")
-                self.assertEqual(table.get_row_at(2)[3].plain, "   0/81920")
+                self.assertEqual(table.get_row_at(1)[3].plain, "2048 / 81920")
+                self.assertEqual(table.get_row_at(2)[3].plain, "   0 / 81920")
                 self.assertEqual(
                     table.get_row_at(1)[3].plain.index("/"),
                     table.get_row_at(2)[3].plain.index("/"),
                 )
                 self.assertEqual(table.get_row_at(2)[2].plain, "Idle")
+                summary = app.query_one("#summary", Static).content.plain
+                self.assertIn("Refresh: manual  •  Last refresh: ", summary)
+                self.assertIsNotNone(app._last_refresh_at)
 
                 table.move_cursor(row=2)
                 await pilot.pause()
@@ -96,5 +99,5 @@ class TuiTests(unittest.IsolatedAsyncioTestCase):
                 self.assertEqual(table.get_row_at(1)[0], "0")
                 self.assertEqual(table.get_row_at(2)[0].plain, "lab-b / gpu02")
                 self.assertEqual(table.get_row_at(3)[0], "0")
-                self.assertEqual(table.get_row_at(1)[3].plain, "40000/81920")
-                self.assertEqual(table.get_row_at(3)[3].plain, "    0/81920")
+                self.assertEqual(table.get_row_at(1)[3].plain, "40000 / 81920")
+                self.assertEqual(table.get_row_at(3)[3].plain, "    0 / 81920")

@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import re
 from dataclasses import dataclass
+from datetime import datetime, timezone
 
 from rich.text import Text
 from textual.app import App, ComposeResult
@@ -28,7 +29,7 @@ def _safe_display(value: str, limit: int = 120) -> str:
 def _memory(used: int | None, total: int | None, used_width: int) -> Text:
     if used is None or total is None:
         return Text("N/A")
-    return Text(f"{used:>{used_width}}/{total}")
+    return Text(f"{used:>{used_width}} / {total}")
 
 
 class GPUTrackerApp(App[None]):
@@ -37,9 +38,9 @@ class GPUTrackerApp(App[None]):
     BINDINGS = [("r", "refresh_gpus", "Refresh"), ("q", "quit", "Quit")]
     CSS = """
     Screen { layout: vertical; }
-    #summary { height: 4; padding: 1 2; color: $text; }
+    #summary { height: 5; padding: 1 2; color: $text; }
     #gpus { height: 1fr; margin: 0 1; border: round $primary; }
-    #details { height: 10; margin: 1; padding: 1 2; border: round $secondary; overflow-y: auto; }
+    #details { height: 8; margin: 1; padding: 1 2; border: round $secondary; overflow-y: auto; }
     """
 
     def __init__(self, settings: Settings) -> None:
@@ -51,6 +52,7 @@ class GPUTrackerApp(App[None]):
         self._rows: list[tuple[Target, Gpu | None]] = []
         self._row_ids: list[tuple[str, str, str]] = []
         self._refreshing = False
+        self._last_refresh_at: datetime | None = None
 
     def compose(self) -> ComposeResult:
         yield Header(show_clock=True)
@@ -61,7 +63,7 @@ class GPUTrackerApp(App[None]):
 
     def on_mount(self) -> None:
         table = self.query_one("#gpus", DataTable)
-        table.add_columns("GPU", "Model", "Status", "Memory (MiB)", "Procs", "Checked")
+        table.add_columns("GPU", "Model", "Status", "Memory (MiB)", "Procs")
         table.cursor_type = "row"
         table.zebra_stripes = True
         self._render()
@@ -100,6 +102,7 @@ class GPUTrackerApp(App[None]):
                 else:
                     state.error = error or "Query failed"
                 self._render()
+            self._last_refresh_at = datetime.now(timezone.utc)
         finally:
             for task in tasks:
                 if not task.done():
@@ -120,10 +123,14 @@ class GPUTrackerApp(App[None]):
                 else:
                     idle += 1
         mode = "manual" if self.settings.refresh_seconds == 0 else f"every {self.settings.refresh_seconds}s"
+        last_refresh = (
+            self._last_refresh_at.astimezone().strftime("%H:%M:%S")
+            if self._last_refresh_at else "—"
+        )
         progress = "  •  Refreshing…" if self._refreshing else ""
         text = Text(
-            f"Idle {idle}   In use {busy}   Unknown hosts {unknown_hosts}"
-            f"   •   Refresh: {mode}{progress}\n"
+            f"Idle {idle}   In use {busy}   Unknown hosts {unknown_hosts}\n"
+            f"Refresh: {mode}  •  Last refresh: {last_refresh}{progress}\n"
             "Idle means no compute process observed; cluster reservations are not checked."
         )
         self.query_one("#summary", Static).update(text)
@@ -150,10 +157,8 @@ class GPUTrackerApp(App[None]):
         for target in self.settings.targets:
             state = self.states[target.key]
             snapshot = state.snapshot
-            checked = snapshot.checked_at.astimezone().strftime("%H:%M:%S") if snapshot else "—"
             table.add_row(
                 Text(f"{target.cluster} / {target.name}", style="bold cyan"),
-                "",
                 "",
                 "",
                 "",
@@ -163,7 +168,7 @@ class GPUTrackerApp(App[None]):
             self._row_ids.append((*target.key, "host"))
             if snapshot is None:
                 status = "Unknown" if state.error else "Waiting"
-                table.add_row("—", "No GPU data", Text(status, style="yellow"), "—", "—", "—")
+                table.add_row("—", "No GPU data", Text(status, style="yellow"), "—", "—")
                 self._rows.append((target, None))
                 self._row_ids.append((*target.key, "placeholder"))
                 continue
@@ -176,7 +181,6 @@ class GPUTrackerApp(App[None]):
                     Text(status, style=color),
                     _memory(gpu.memory_used_mib, gpu.memory_total_mib, used_width),
                     str(len(gpu.processes)) if not state.error else "—",
-                    checked,
                 )
                 self._rows.append((target, gpu))
                 self._row_ids.append((*target.key, gpu.uuid))
