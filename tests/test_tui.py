@@ -42,9 +42,15 @@ class TuiTests(unittest.IsolatedAsyncioTestCase):
                 table = app.query_one("#gpus", DataTable)
                 self.assertEqual(calls, 1)
                 self.assertEqual(table.row_count, 3)
-                self.assertEqual(table.get_row_at(0)[1].plain, "HOST gpu01")
-                self.assertEqual(table.get_row_at(1)[4].plain, "In use")
-                self.assertEqual(table.get_row_at(2)[4].plain, "Idle")
+                self.assertEqual(
+                    [column.label.plain for column in table.columns.values()],
+                    ["GPU", "Model", "Status", "Memory (MiB)", "Procs", "Checked"],
+                )
+                self.assertEqual(table.get_row_at(0)[0].plain, "lab / gpu01")
+                self.assertEqual(table.get_row_at(0)[1:], ["", "", "", "", ""])
+                self.assertEqual(table.get_row_at(1)[2].plain, "In use")
+                self.assertEqual(table.get_row_at(1)[3], "2048/81920")
+                self.assertEqual(table.get_row_at(2)[2].plain, "Idle")
 
                 table.move_cursor(row=2)
                 await pilot.pause()
@@ -53,8 +59,7 @@ class TuiTests(unittest.IsolatedAsyncioTestCase):
                 await pilot.pause()
                 self.assertEqual(calls, 2)
                 self.assertEqual(table.row_count, 3)
-                self.assertEqual(table.get_row_at(0)[4].plain, "Unknown")
-                self.assertEqual(table.get_row_at(1)[4].plain, "Unknown")
+                self.assertEqual(table.get_row_at(1)[2].plain, "Unknown")
                 self.assertEqual(table.cursor_row, 2)
                 self.assertIs(app.states[target.key].snapshot, snapshot)
 
@@ -81,7 +86,7 @@ class TuiTests(unittest.IsolatedAsyncioTestCase):
                 await pilot.pause()
                 table = app.query_one("#gpus", DataTable)
                 self.assertEqual(table.row_count, 4)
-                self.assertEqual(table.get_row_at(0)[1].plain, "HOST gpu01")
-                self.assertEqual(table.get_row_at(1)[2], "0")
-                self.assertEqual(table.get_row_at(2)[1].plain, "HOST gpu02")
-                self.assertEqual(table.get_row_at(3)[2], "0")
+                self.assertEqual(table.get_row_at(0)[0].plain, "lab-a / gpu01")
+                self.assertEqual(table.get_row_at(1)[0], "0")
+                self.assertEqual(table.get_row_at(2)[0].plain, "lab-b / gpu02")
+                self.assertEqual(table.get_row_at(3)[0], "0")

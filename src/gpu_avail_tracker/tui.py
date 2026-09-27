@@ -28,11 +28,7 @@ def _safe_display(value: str, limit: int = 120) -> str:
 def _memory(used: int | None, total: int | None) -> str:
     if used is None or total is None:
         return "N/A"
-    return f"{used}/{total} MiB"
-
-
-def _bar(width: int) -> Text:
-    return Text("─" * width, style="cyan")
+    return f"{used}/{total}"
 
 
 class GPUTrackerApp(App[None]):
@@ -65,7 +61,7 @@ class GPUTrackerApp(App[None]):
 
     def on_mount(self) -> None:
         table = self.query_one("#gpus", DataTable)
-        table.add_columns("Cluster", "Host", "GPU", "Model", "Status", "Memory", "Procs", "Checked")
+        table.add_columns("GPU", "Model", "Status", "Memory (MiB)", "Procs", "Checked")
         table.cursor_type = "row"
         table.zebra_stripes = True
         self._render()
@@ -145,23 +141,20 @@ class GPUTrackerApp(App[None]):
         for target in self.settings.targets:
             state = self.states[target.key]
             snapshot = state.snapshot
-            host_status = "Unknown" if state.error else ("Host OK" if snapshot else "Waiting")
             checked = snapshot.checked_at.astimezone().strftime("%H:%M:%S") if snapshot else "—"
             table.add_row(
-                Text(target.cluster, style="bold cyan"),
-                Text(f"HOST {target.name}", style="bold cyan"),
-                _bar(3),
-                _bar(12),
-                Text(host_status, style="yellow" if state.error else "cyan"),
-                _bar(12),
-                _bar(5),
-                Text(checked, style="cyan"),
+                Text(f"{target.cluster} / {target.name}", style="bold cyan"),
+                "",
+                "",
+                "",
+                "",
+                "",
             )
             self._rows.append((target, None))
             self._row_ids.append((*target.key, "host"))
             if snapshot is None:
                 status = "Unknown" if state.error else "Waiting"
-                table.add_row("", "", "—", "No GPU data", Text(status, style="yellow"), "—", "—", "—")
+                table.add_row("—", "No GPU data", Text(status, style="yellow"), "—", "—", "—")
                 self._rows.append((target, None))
                 self._row_ids.append((*target.key, "placeholder"))
                 continue
@@ -169,8 +162,6 @@ class GPUTrackerApp(App[None]):
                 status = "Unknown" if state.error else ("In use" if gpu.processes else "Idle")
                 color = "yellow" if state.error else ("red" if gpu.processes else "green")
                 table.add_row(
-                    "",
-                    "",
                     str(gpu.index),
                     _safe_display(gpu.name, 50),
                     Text(status, style=color),
