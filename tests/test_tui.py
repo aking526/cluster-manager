@@ -41,13 +41,47 @@ class TuiTests(unittest.IsolatedAsyncioTestCase):
                 await pilot.pause()
                 table = app.query_one("#gpus", DataTable)
                 self.assertEqual(calls, 1)
-                self.assertEqual(table.row_count, 2)
-                self.assertEqual(table.get_row_at(0)[4].plain, "In use")
-                self.assertEqual(table.get_row_at(1)[4].plain, "Idle")
+                self.assertEqual(table.row_count, 3)
+                self.assertEqual(table.get_row_at(0)[1].plain, "HOST gpu01")
+                self.assertEqual(table.get_row_at(1)[4].plain, "In use")
+                self.assertEqual(table.get_row_at(2)[4].plain, "Idle")
+
+                table.move_cursor(row=2)
+                await pilot.pause()
 
                 await pilot.press("r")
                 await pilot.pause()
                 self.assertEqual(calls, 2)
-                self.assertEqual(table.row_count, 2)
+                self.assertEqual(table.row_count, 3)
                 self.assertEqual(table.get_row_at(0)[4].plain, "Unknown")
+                self.assertEqual(table.get_row_at(1)[4].plain, "Unknown")
+                self.assertEqual(table.cursor_row, 2)
                 self.assertIs(app.states[target.key].snapshot, snapshot)
+
+    async def test_each_host_has_its_own_heading(self) -> None:
+        from textual.widgets import DataTable
+
+        from gpu_avail_tracker.tui import GPUTrackerApp
+
+        targets = (
+            Target("lab-a", "gpu01", "one.example", "alice", Path("/tmp/key")),
+            Target("lab-b", "gpu02", "two.example", "alice", Path("/tmp/key")),
+        )
+
+        async def fake_query(target: Target) -> Snapshot:
+            return Snapshot(
+                target,
+                (Gpu(0, f"GPU-{target.name}", "NVIDIA A100", 81920, 0, ()),),
+                datetime.now(timezone.utc),
+            )
+
+        with patch("gpu_avail_tracker.tui.query_target", side_effect=fake_query):
+            app = GPUTrackerApp(Settings(targets, 0))
+            async with app.run_test(size=(100, 30)) as pilot:
+                await pilot.pause()
+                table = app.query_one("#gpus", DataTable)
+                self.assertEqual(table.row_count, 4)
+                self.assertEqual(table.get_row_at(0)[1].plain, "HOST gpu01")
+                self.assertEqual(table.get_row_at(1)[2], "0")
+                self.assertEqual(table.get_row_at(2)[1].plain, "HOST gpu02")
+                self.assertEqual(table.get_row_at(3)[2], "0")
