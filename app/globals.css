@@ -69,7 +69,7 @@ h1 { font-size: clamp(29px, 3.3vw, 41px); font-weight: 720; letter-spacing: -.05
 .metric-bottom { color: #72859b; font-size: 10px; display: flex; align-items: center; gap: 6px; }
 .metric-indicator { width: 5px; height: 5px; border-radius: 50%; background: currentColor; flex: 0 0 5px; }
 .inventory { margin-top: 42px; }
-.inventory-header { display: flex; justify-content: space-between; align-items: end; gap: 18px; margin-bottom: 21px; }
+.inventory-header { display: flex; justify-content: space-between; align-items: flex-end; gap: 18px; margin-bottom: 21px; }
 .section-kicker { color: #70dcae; }
 h2 { font-size: 21px; font-weight: 680; letter-spacing: -.035em; margin: 10px 0 0; }
 .count-badge { display: inline-flex; vertical-align: 2px; min-width: 22px; height: 21px; padding: 0 6px; border-radius: 5px; align-items: center; justify-content: center; font-size: 10px; letter-spacing: 0; background: #24364a; color: #b4c5d7; margin-left: 5px; }
@@ -152,7 +152,7 @@ select option { background: #182638; }
 }
 @media (max-width: 850px) {
   .sidebar { width: 68px; flex-basis: 68px; padding: 25px 10px; align-items: center; }
-  .brand { margin: 0 0 55px; }.brand > span:last-child, .nav-label, .nav-item:not(.active), .nav-item.active { font-size: 0; }
+  .brand { margin: 0 0 55px; }.brand > span:last-child, .nav-label { display: none; }.nav-item { font-size: 0; }
   nav { width: 100%; }.nav-item { padding: 12px; justify-content: center; }.nav-icon { font-size: 20px; }
   .sidebar-bottom { display: none; }
   .metrics { grid-template-columns: repeat(2, minmax(0, 1fr)); }

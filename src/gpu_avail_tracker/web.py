@@ -58,8 +58,8 @@ class Dashboard:
             self._wake.wait(self.settings.refresh_seconds or None)
             if self._stop.is_set():
                 break
-            self._wake.clear()
             with self._lock:
+                self._wake.clear()
                 self.refreshing = True
             try:
                 asyncio.run(self._refresh())

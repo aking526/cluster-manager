@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import json
 import threading
+import time
 import unittest
 from datetime import datetime, timezone
 from pathlib import Path
@@ -84,3 +85,39 @@ class DashboardTests(unittest.TestCase):
             finally:
                 server.shutdown()
                 thread.join()
+
+    def test_launch_refresh_does_not_overlap_manual_requests(self) -> None:
+        entered = threading.Event()
+        release = threading.Event()
+        calls = 0
+
+        async def query(_target: Target) -> Snapshot:
+            nonlocal calls
+            calls += 1
+            entered.set()
+            await asyncio.to_thread(release.wait, 5)
+            return self.snapshot
+
+        with (
+            patch("gpu_avail_tracker.web.query_target", side_effect=query),
+            patch("gpu_avail_tracker.web.query_project_files", return_value=self.projects),
+        ):
+            self.dashboard.start()
+            try:
+                self.assertTrue(entered.wait(2))
+                self.assertTrue(self.dashboard.payload()["refreshing"])
+                self.assertFalse(self.dashboard.request_refresh())
+                self.assertEqual(calls, 1)
+                release.set()
+                deadline = time.monotonic() + 2
+                while self.dashboard.payload()["refreshing"] and time.monotonic() < deadline:
+                    time.sleep(0.01)
+                self.assertFalse(self.dashboard.payload()["refreshing"])
+                self.assertTrue(self.dashboard.request_refresh())
+                deadline = time.monotonic() + 2
+                while calls < 2 and time.monotonic() < deadline:
+                    time.sleep(0.01)
+                self.assertEqual(calls, 2)
+            finally:
+                release.set()
+                self.dashboard.close()
