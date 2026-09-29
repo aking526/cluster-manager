@@ -43,6 +43,31 @@ class ConfigTests(unittest.TestCase):
         settings = load_settings(self.env_file, environ={"GPU_TRACKER_REFRESH_SECONDS": "30"})
         self.assertEqual(settings.refresh_seconds, 30)
 
+    def test_project_directories_are_shared_by_hosts_in_cluster(self) -> None:
+        self._env([
+            {"cluster": "lab-a", "name": "one", "host": "one.example"},
+            {"cluster": "lab-a", "name": "two", "host": "two.example"},
+            {"cluster": "lab-b", "name": "one", "host": "other.example"},
+        ])
+        settings = load_settings(
+            self.env_file,
+            environ={"GPU_TRACKER_PROJECT_DIRS": json.dumps({"lab-a": ["/work/models", "/work/my project"]})},
+        )
+        self.assertEqual(settings.targets[0].project_dirs, ("/work/models", "/work/my project"))
+        self.assertEqual(settings.targets[1].project_dirs, settings.targets[0].project_dirs)
+        self.assertEqual(settings.targets[2].project_dirs, ())
+
+    def test_invalid_project_directory_configuration_is_rejected(self) -> None:
+        self._env([{"cluster": "lab", "name": "gpu", "host": "gpu.example"}])
+        for value, error in (
+            ('{"other":["/work"]}', "unknown clusters"),
+            ('{"lab":"~/models"}', "array"),
+            ('{"lab":["relative/path"]}', "absolute POSIX"),
+            ('{"lab":["/work\\nother"]}', "control character"),
+        ):
+            with self.subTest(value=value), self.assertRaisesRegex(ConfigError, error):
+                load_settings(self.env_file, environ={"GPU_TRACKER_PROJECT_DIRS": value})
+
     def test_duplicate_target_and_unsafe_host_are_rejected(self) -> None:
         target = {"cluster": "lab", "name": "gpu", "host": "gpu.example"}
         self._env([target, target])

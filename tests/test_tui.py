@@ -7,11 +7,66 @@ from pathlib import Path
 from unittest.mock import patch
 
 from gpu_avail_tracker.config import Settings, Target
-from gpu_avail_tracker.probe import Gpu, GpuProcess, ProbeError, Snapshot
+from gpu_avail_tracker.probe import Checkpoint, Gpu, GpuProcess, ProbeError, ProjectSnapshot, Snapshot
 
 
 @unittest.skipUnless(importlib.util.find_spec("textual"), "Textual is not installed")
 class TuiTests(unittest.IsolatedAsyncioTestCase):
+    async def test_checkpoint_view_and_independent_scan_failure(self) -> None:
+        from textual.widgets import DataTable, Static
+
+        from gpu_avail_tracker.tui import GPUTrackerApp
+
+        target = Target(
+            "lab", "gpu01", "gpu.example", "alice", Path("/tmp/key"),
+            project_dirs=("/work/models",),
+        )
+        gpu_snapshot = Snapshot(
+            target, (Gpu(0, "GPU-aaa", "NVIDIA A100", 81920, 0, ()),),
+            datetime.now(timezone.utc),
+        )
+        project_snapshot = ProjectSnapshot(
+            (Checkpoint("/work/models/run/weights.safetensors", 1024, datetime.now(timezone.utc)),),
+            datetime.now(timezone.utc),
+        )
+        scans = 0
+
+        async def fake_scan(_target: Target) -> ProjectSnapshot:
+            nonlocal scans
+            scans += 1
+            if scans > 1:
+                raise ProbeError("Permission denied")
+            return project_snapshot
+
+        with (
+            patch("gpu_avail_tracker.tui.query_target", return_value=gpu_snapshot),
+            patch("gpu_avail_tracker.tui.query_project_files", side_effect=fake_scan),
+        ):
+            app = GPUTrackerApp(Settings((target,), 0))
+            async with app.run_test(size=(100, 30)) as pilot:
+                await pilot.pause()
+                await pilot.press("w")
+                await pilot.pause()
+                table = app.query_one("#checkpoints", DataTable)
+                self.assertTrue(table.display)
+                self.assertFalse(app.query_one("#gpus", DataTable).display)
+                self.assertEqual(table.get_row_at(1)[1], "weights.safetensors")
+                table.move_cursor(row=1)
+                await pilot.pause()
+                self.assertIn(
+                    "/work/models/run/weights.safetensors",
+                    app.query_one("#details", Static).content.plain,
+                )
+                await pilot.press("r")
+                await pilot.pause()
+                self.assertEqual(table.row_count, 2)
+                self.assertEqual(table.get_row_at(1)[1], "weights.safetensors")
+                self.assertIn("Scan error: Permission denied", app.query_one("#details", Static).content.plain)
+                self.assertEqual(app.states[target.key].snapshot, gpu_snapshot)
+                await pilot.press("w")
+                await pilot.pause()
+                self.assertTrue(app.query_one("#gpus", DataTable).display)
+
     async def test_launch_manual_refresh_and_stale_error(self) -> None:
         from textual.widgets import DataTable, Static
 

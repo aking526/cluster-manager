@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import csv
 import io
+import math
 import re
 from dataclasses import dataclass
 from datetime import datetime, timezone
@@ -41,6 +42,19 @@ class Snapshot:
     checked_at: datetime
 
 
+@dataclass(frozen=True)
+class Checkpoint:
+    path: str
+    size_bytes: int
+    modified_at: datetime
+
+
+@dataclass(frozen=True)
+class ProjectSnapshot:
+    files: tuple[Checkpoint, ...]
+    checked_at: datetime
+
+
 # The script is constant: configuration values are SSH argv entries, never shell code.
 # Length-prefixed blocks keep process names from masquerading as protocol delimiters.
 REMOTE_SCRIPT = """set -eu
@@ -53,6 +67,17 @@ for block in "$gpus" "$apps" "$owners"; do
     length="$(printf '%s' "$block" | wc -c)"
     printf '%s\\n' "$length"
     printf '%s' "$block"
+done
+"""
+
+REMOTE_FILES_SCRIPT = """set -eu
+export LC_ALL=C
+printf 'CHECKPOINTS_V1\\0'
+while IFS= read -r directory; do
+    find "$directory" -type f \\( -iname '*.ckpt' -o -iname '*.pt' -o -iname '*.pth' \\
+        -o -iname '*.bin' -o -iname '*.safetensors' -o -iname '*.onnx' \\
+        -o -iname '*.h5' -o -iname '*.hdf5' -o -iname '*.gguf' \\
+        -o -iname '*.weights' \\) -printf '%p\\0%s\\0%T@\\0'
 done
 """
 
@@ -167,11 +192,33 @@ def _error_text(stderr: bytes) -> str:
     return first[:180]
 
 
-async def query_target(
-    target: Target, *, ssh_binary: str = "ssh", timeout_seconds: float = 15
-) -> Snapshot:
-    """Query one Linux GPU host without allowing interactive SSH prompts."""
-    command = [
+def parse_project_files(payload: bytes, target: Target) -> ProjectSnapshot:
+    if len(payload) > 16_000_000 or not payload.startswith(b"CHECKPOINTS_V1\0"):
+        raise ProbeError("Invalid checkpoint response")
+    records = payload[len(b"CHECKPOINTS_V1\0"):].split(b"\0")
+    if records[-1] != b"" or (len(records) - 1) % 3:
+        raise ProbeError("Incomplete checkpoint response")
+    files: dict[str, Checkpoint] = {}
+    for offset in range(0, len(records) - 1, 3):
+        path = records[offset].decode("utf-8", "replace")
+        try:
+            size = int(records[offset + 1])
+            timestamp = float(records[offset + 2])
+            if size < 0 or not math.isfinite(timestamp):
+                raise ValueError
+            modified_at = datetime.fromtimestamp(timestamp, timezone.utc)
+        except (ValueError, OverflowError, OSError) as exc:
+            raise ProbeError("Invalid checkpoint metadata") from exc
+        if not path.startswith("/") or not any(
+            path.startswith(directory.rstrip("/") + "/") for directory in target.project_dirs
+        ):
+            raise ProbeError("Checkpoint path is outside configured directories")
+        files[path] = Checkpoint(path, size, modified_at)
+    return ProjectSnapshot(tuple(sorted(files.values(), key=lambda file: file.path)), datetime.now(timezone.utc))
+
+
+def _ssh_command(target: Target, ssh_binary: str) -> list[str]:
+    return [
         ssh_binary,
         "-T",
         "-o", "BatchMode=yes",
@@ -184,9 +231,12 @@ async def query_target(
         "-p", str(target.port),
         "--", f"{target.user}@{target.host}", "sh", "-s",
     ]
+
+
+async def _run_ssh(target: Target, script: bytes, ssh_binary: str, timeout_seconds: float) -> bytes:
     try:
         process = await asyncio.create_subprocess_exec(
-            *command,
+            *_ssh_command(target, ssh_binary),
             stdin=asyncio.subprocess.PIPE,
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.PIPE,
@@ -195,7 +245,7 @@ async def query_target(
         raise ProbeError(f"Could not start SSH: {exc}") from exc
     try:
         stdout, stderr = await asyncio.wait_for(
-            process.communicate(REMOTE_SCRIPT.encode("utf-8")), timeout=timeout_seconds
+            process.communicate(script), timeout=timeout_seconds
         )
     except (asyncio.TimeoutError, asyncio.CancelledError) as exc:
         process.kill()
@@ -205,4 +255,25 @@ async def query_target(
         raise ProbeError(f"SSH query timed out after {timeout_seconds:g}s") from exc
     if process.returncode != 0:
         raise ProbeError(_error_text(stderr))
-    return parse_snapshot(stdout, target)
+    return stdout
+
+
+async def query_project_files(
+    target: Target, *, ssh_binary: str = "ssh", timeout_seconds: float = 30
+) -> ProjectSnapshot:
+    """List checkpoint metadata below the configured directories on one host."""
+    if not target.project_dirs:
+        return ProjectSnapshot((), datetime.now(timezone.utc))
+    script = REMOTE_FILES_SCRIPT.encode("utf-8") + (
+        "\n".join(target.project_dirs) + "\n"
+    ).encode("utf-8")
+    return parse_project_files(await _run_ssh(target, script, ssh_binary, timeout_seconds), target)
+
+
+async def query_target(
+    target: Target, *, ssh_binary: str = "ssh", timeout_seconds: float = 15
+) -> Snapshot:
+    """Query one Linux GPU host without allowing interactive SSH prompts."""
+    return parse_snapshot(
+        await _run_ssh(target, REMOTE_SCRIPT.encode("utf-8"), ssh_binary, timeout_seconds), target
+    )

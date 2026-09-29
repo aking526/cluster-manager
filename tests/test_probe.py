@@ -11,7 +11,15 @@ from unittest.mock import patch
 import subprocess
 
 from gpu_avail_tracker.config import Target
-from gpu_avail_tracker.probe import ProbeError, REMOTE_SCRIPT, parse_snapshot, query_target
+from gpu_avail_tracker.probe import (
+    ProbeError,
+    REMOTE_FILES_SCRIPT,
+    REMOTE_SCRIPT,
+    parse_project_files,
+    parse_snapshot,
+    query_project_files,
+    query_target,
+)
 
 
 def frame(*blocks: str) -> bytes:
@@ -81,6 +89,34 @@ class ProbeParsingTests(unittest.TestCase):
             snapshot = parse_snapshot(result.stdout, self.target)
             self.assertEqual(snapshot.gpus[0].processes[0].user, "alice")
 
+    def test_remote_checkpoint_scan_recurses_and_reports_metadata(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory) / "model project"
+            nested = root / "run 1"
+            nested.mkdir(parents=True)
+            (nested / "weights.SAFETENSORS").write_bytes(b"weights")
+            (nested / "notes.txt").write_text("ignore", encoding="utf-8")
+            target = Target("lab", "gpu01", "gpu.example", "alice", Path("/tmp/key"), project_dirs=(str(root),))
+            result = subprocess.run(
+                ["sh", "-s"],
+                input=(REMOTE_FILES_SCRIPT + str(root) + "\n").encode("utf-8"),
+                capture_output=True,
+                check=True,
+            )
+            snapshot = parse_project_files(result.stdout, target)
+            self.assertEqual([file.path for file in snapshot.files], [str(nested / "weights.SAFETENSORS")])
+            self.assertEqual(snapshot.files[0].size_bytes, 7)
+
+    def test_invalid_checkpoint_response_is_rejected(self) -> None:
+        target = Target("lab", "gpu", "gpu.example", "alice", Path("/tmp/key"), project_dirs=("/work",))
+        for payload, error in (
+            (b"CHECKPOINTS_V1\0/work/a.pt\0", "Incomplete"),
+            (b"CHECKPOINTS_V1\0/elsewhere/a.pt\0" b"1\0" b"1.0\0", "outside"),
+            (b"CHECKPOINTS_V1\0/work/a.pt\0" b"-1\0" b"1.0\0", "metadata"),
+        ):
+            with self.subTest(payload=payload), self.assertRaisesRegex(ProbeError, error):
+                parse_project_files(payload, target)
+
 
 class FakeSshTests(unittest.IsolatedAsyncioTestCase):
     async def asyncSetUp(self) -> None:
@@ -136,3 +172,24 @@ class FakeSshTests(unittest.IsolatedAsyncioTestCase):
         with patch.dict(os.environ, {**self.base_env, "FAKE_SLEEP": "1"}):
             with self.assertRaisesRegex(ProbeError, "timed out"):
                 await query_target(self.target, ssh_binary=str(self.ssh), timeout_seconds=0.05)
+
+    async def test_project_paths_are_sent_as_data_to_ssh(self) -> None:
+        target = Target(
+            "lab", "gpu01", "gpu.example", "alice", self.key, 2222,
+            ("/work/my project", "/work/$(touch /tmp/never-run)"),
+        )
+        payload = b"CHECKPOINTS_V1\0/work/my project/run/checkpoint.pt\0" b"123\0" b"1790000000.0\0"
+        with patch.dict(os.environ, {**self.base_env, "FAKE_PAYLOAD": base64.b64encode(payload).decode()}):
+            snapshot = await query_project_files(target, ssh_binary=str(self.ssh))
+        self.assertEqual(snapshot.files[0].size_bytes, 123)
+        script = self.script_file.read_text(encoding="utf-8")
+        self.assertIn('find "$directory"', script)
+        self.assertTrue(script.endswith("/work/my project\n/work/$(touch /tmp/never-run)\n"))
+
+    async def test_project_scan_error_is_reported(self) -> None:
+        target = Target(
+            "lab", "gpu01", "gpu.example", "alice", self.key, 2222, ("/missing",)
+        )
+        with patch.dict(os.environ, {**self.base_env, "FAKE_FAIL": "1"}):
+            with self.assertRaisesRegex(ProbeError, "Permission denied"):
+                await query_project_files(target, ssh_binary=str(self.ssh))

@@ -22,6 +22,7 @@ class Target:
     user: str
     identity_file: Path
     port: int = 22
+    project_dirs: tuple[str, ...] = ()
 
     @property
     def key(self) -> tuple[str, str]:
@@ -123,6 +124,28 @@ def load_settings(
     if not isinstance(target_data, list) or not target_data:
         raise ConfigError("GPU_TRACKER_TARGETS must be a nonempty JSON array")
 
+    try:
+        project_data = json.loads(values.get("GPU_TRACKER_PROJECT_DIRS", "{}"))
+    except json.JSONDecodeError as exc:
+        raise ConfigError(f"GPU_TRACKER_PROJECT_DIRS must be JSON: {exc.msg}") from exc
+    if not isinstance(project_data, dict):
+        raise ConfigError("GPU_TRACKER_PROJECT_DIRS must be a JSON object")
+    project_dirs: dict[str, tuple[str, ...]] = {}
+    for cluster, directories in project_data.items():
+        label = f"GPU_TRACKER_PROJECT_DIRS[{cluster!r}]"
+        if not isinstance(cluster, str) or not cluster.strip():
+            raise ConfigError("GPU_TRACKER_PROJECT_DIRS keys must be cluster names")
+        if not isinstance(directories, list):
+            raise ConfigError(f"{label} must be an array of absolute directories")
+        paths: list[str] = []
+        for directory in directories:
+            path = _text(directory, label)
+            if not path.startswith("/"):
+                raise ConfigError(f"{label} must contain absolute POSIX paths")
+            if path not in paths:
+                paths.append(path)
+        project_dirs[cluster] = tuple(paths)
+
     targets: list[Target] = []
     seen: set[tuple[str, str]] = set()
     for index, item in enumerate(target_data, 1):
@@ -148,7 +171,15 @@ def load_settings(
         if key in seen:
             raise ConfigError(f"Duplicate target {cluster}/{name}")
         seen.add(key)
-        targets.append(Target(cluster, name, host, target_user, target_identity, port))
+        targets.append(
+            Target(cluster, name, host, target_user, target_identity, port, project_dirs.get(cluster, ()))
+        )
+
+    unknown_clusters = set(project_dirs) - {target.cluster for target in targets}
+    if unknown_clusters:
+        raise ConfigError(
+            f"GPU_TRACKER_PROJECT_DIRS has unknown clusters: {', '.join(sorted(unknown_clusters))}"
+        )
 
     refresh_value = values.get("GPU_TRACKER_REFRESH_SECONDS", "0")
     try:
