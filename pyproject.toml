@@ -5,10 +5,10 @@ build-backend = "hatchling.build"
 [project]
 name = "cluster-manager"
 version = "0.1.0"
-description = "A read-only terminal dashboard for GPU processes on SSH hosts"
+description = "A local web dashboard for GPU processes on SSH hosts"
 readme = "README.md"
 requires-python = ">=3.11"
-dependencies = ["textual>=8.0,<9"]
+dependencies = []
 
 [project.scripts]
 cluster-manager = "gpu_avail_tracker.cli:main"
