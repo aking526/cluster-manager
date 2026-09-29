@@ -1,4 +1,4 @@
-# GPU Availability Tracker
+# Cluster Manager
 
 A local, read-only terminal dashboard for NVIDIA GPU hosts that you can reach over SSH. It shows each physical GPU, active compute processes, the process owners, and the time of the last successful query.
 
@@ -43,7 +43,7 @@ Before running the TUI, verify each host's fingerprint through your lab's truste
 ## Run
 
 ```sh
-.venv/bin/gpu-avail
+.venv/bin/cluster-manager
 ```
 
 Use `--env-file path/to/.env` to load a different file. Each host has a heading above its GPU rows. Press `r` to refresh, arrow keys to select a host or GPU, and `q` to quit. The app queries once at launch. The summary shows when the last full refresh finished; selecting a host shows its last successful check. Set `GPU_TRACKER_REFRESH_SECONDS` to `10` or higher to add automatic refresh; `0` keeps manual mode. Refreshes never overlap, and at most four hosts are queried at once.
