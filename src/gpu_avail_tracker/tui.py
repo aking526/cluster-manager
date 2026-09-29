@@ -124,7 +124,7 @@ class GPUTrackerApp(App[None]):
                     idle += 1
         mode = "manual" if self.settings.refresh_seconds == 0 else f"every {self.settings.refresh_seconds}s"
         last_refresh = (
-            self._last_refresh_at.astimezone().strftime("%H:%M:%S")
+            self._last_refresh_at.astimezone().strftime("%Y-%m-%d %H:%M:%S")
             if self._last_refresh_at else "—"
         )
         progress = "  •  Refreshing…" if self._refreshing else ""

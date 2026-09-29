@@ -59,6 +59,7 @@ class TuiTests(unittest.IsolatedAsyncioTestCase):
                 summary = app.query_one("#summary", Static).content.plain
                 self.assertIn("Refresh: manual  •  Last refresh: ", summary)
                 self.assertIsNotNone(app._last_refresh_at)
+                self.assertIn(app._last_refresh_at.astimezone().strftime("%Y-%m-%d"), summary)
 
                 table.move_cursor(row=2)
                 await pilot.pause()
