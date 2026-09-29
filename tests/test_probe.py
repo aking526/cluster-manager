@@ -91,7 +91,7 @@ class ProbeParsingTests(unittest.TestCase):
 
     def test_remote_checkpoint_scan_recurses_and_reports_metadata(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
-            root = Path(directory) / "model project"
+            root = Path(directory) / "model $(echo injected)"
             nested = root / "run 1"
             nested.mkdir(parents=True)
             (nested / "weights.SAFETENSORS").write_bytes(b"weights")
@@ -99,7 +99,7 @@ class ProbeParsingTests(unittest.TestCase):
             target = Target("lab", "gpu01", "gpu.example", "alice", Path("/tmp/key"), project_dirs=(str(root),))
             result = subprocess.run(
                 ["sh", "-s"],
-                input=(REMOTE_FILES_SCRIPT + str(root) + "\n").encode("utf-8"),
+                input=(REMOTE_FILES_SCRIPT + str(root) + "\nEND_PROJECT_DIRS\n").encode("utf-8"),
                 capture_output=True,
                 check=True,
             )
@@ -184,7 +184,7 @@ class FakeSshTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(snapshot.files[0].size_bytes, 123)
         script = self.script_file.read_text(encoding="utf-8")
         self.assertIn('find "$directory"', script)
-        self.assertTrue(script.endswith("/work/my project\n/work/$(touch /tmp/never-run)\n"))
+        self.assertTrue(script.endswith("/work/my project\n/work/$(touch /tmp/never-run)\nEND_PROJECT_DIRS\n"))
 
     async def test_project_scan_error_is_reported(self) -> None:
         target = Target(

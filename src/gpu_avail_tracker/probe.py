@@ -78,7 +78,7 @@ while IFS= read -r directory; do
         -o -iname '*.bin' -o -iname '*.safetensors' -o -iname '*.onnx' \\
         -o -iname '*.h5' -o -iname '*.hdf5' -o -iname '*.gguf' \\
         -o -iname '*.weights' \\) -printf '%p\\0%s\\0%T@\\0'
-done
+done <<'END_PROJECT_DIRS'
 """
 
 
@@ -264,8 +264,8 @@ async def query_project_files(
     """List checkpoint metadata below the configured directories on one host."""
     if not target.project_dirs:
         return ProjectSnapshot((), datetime.now(timezone.utc))
-    script = REMOTE_FILES_SCRIPT.encode("utf-8") + (
-        "\n".join(target.project_dirs) + "\n"
+    script = (
+        REMOTE_FILES_SCRIPT + "\n".join(target.project_dirs) + "\nEND_PROJECT_DIRS\n"
     ).encode("utf-8")
     return parse_project_files(await _run_ssh(target, script, ssh_binary, timeout_seconds), target)
 
