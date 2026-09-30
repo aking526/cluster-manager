@@ -11,7 +11,7 @@ const next = join(root, "node_modules", "next", "dist", "bin", "next");
 const env = { ...process.env, PYTHONPATH: join(root, "src") };
 const api = spawn(python, [
   "-m", "gpu_avail_tracker", "--api-only",
-  "--env-file", process.env.GPU_TRACKER_ENV_FILE || join(root, ".env"),
+  "--config", process.env.GPU_TRACKER_CONFIG_FILE || join(root, "env.yml"),
   "--api-port", process.env.GPU_TRACKER_API_PORT || "8000",
 ], { cwd: root, env, stdio: "inherit" });
 const web = spawn(process.execPath, [

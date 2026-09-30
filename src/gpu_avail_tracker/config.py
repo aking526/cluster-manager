@@ -1,4 +1,4 @@
-"""Load and validate the intentionally small .env configuration format."""
+"""Load and validate local YAML configuration and environment overrides."""
 
 from __future__ import annotations
 
@@ -8,6 +8,8 @@ import re
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Mapping
+
+import yaml
 
 
 class ConfigError(ValueError):
@@ -22,7 +24,8 @@ class Target:
     user: str
     identity_file: Path
     port: int = 22
-    project_dirs: tuple[str, ...] = ()
+    disk_paths: tuple[str, ...] = ()
+    folder_paths: tuple[str, ...] = ()
 
     @property
     def key(self) -> tuple[str, str]:
@@ -33,41 +36,58 @@ class Target:
 class Settings:
     targets: tuple[Target, ...]
     refresh_seconds: int = 0
+    folder_refresh_seconds: int = 300
 
 
-_ENV_KEY = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
 _USERNAME = re.compile(r"^[A-Za-z_][A-Za-z0-9_.-]*[$]?$")
+_ENV_FIELDS = {
+    "GPU_TRACKER_SSH_USER": "ssh_user",
+    "GPU_TRACKER_SSH_KEY": "ssh_key",
+    "GPU_TRACKER_REFRESH_SECONDS": "refresh_seconds",
+    "GPU_TRACKER_FOLDER_REFRESH_SECONDS": "folder_refresh_seconds",
+    "GPU_TRACKER_TARGETS": "targets",
+}
 
 
-def _read_env_file(path: Path) -> dict[str, str]:
+class _ConfigLoader(yaml.SafeLoader):
+    def construct_mapping(self, node, deep=False):
+        seen = set()
+        for key_node, _ in node.value:
+            key = self.construct_object(key_node, deep=deep)
+            if not isinstance(key, str):
+                raise ConfigError("YAML field names must be strings")
+            if key in seen:
+                raise ConfigError(f"Duplicate YAML field: {key}")
+            seen.add(key)
+        return super().construct_mapping(node, deep=deep)
+
+
+def _read_yaml_file(path: Path) -> dict:
     if not path.exists():
         return {}
     try:
-        lines = path.read_text(encoding="utf-8").splitlines()
-    except OSError as exc:
+        values = yaml.load(path.read_text(encoding="utf-8"), Loader=_ConfigLoader)
+    except (OSError, UnicodeError) as exc:
         raise ConfigError(f"Cannot read {path}: {exc}") from exc
-
-    values: dict[str, str] = {}
-    for line_number, raw in enumerate(lines, 1):
-        line = raw.strip()
-        if not line or line.startswith("#"):
-            continue
-        if "=" not in line:
-            raise ConfigError(f"{path}:{line_number}: expected KEY=value")
-        key, value = line.split("=", 1)
-        key = key.strip()
-        value = value.strip()
-        if not _ENV_KEY.fullmatch(key):
-            raise ConfigError(f"{path}:{line_number}: invalid variable name")
-        if key in values:
-            raise ConfigError(f"{path}:{line_number}: duplicate {key}")
-        if value.startswith(("'", '"')):
-            quote = value[0]
-            if len(value) < 2 or value[-1] != quote:
-                raise ConfigError(f"{path}:{line_number}: unmatched quote")
-            value = value[1:-1]
-        values[key] = value
+    except yaml.YAMLError as exc:
+        mark = getattr(exc, "problem_mark", None)
+        location = f":{mark.line + 1}:{mark.column + 1}" if mark else ""
+        raise ConfigError(f"Invalid YAML in {path}{location}") from exc
+    if not isinstance(values, dict):
+        raise ConfigError(f"{path} must contain a YAML mapping (see env.example.yml)")
+    unknown = set(values) - set(_ENV_FIELDS.values())
+    if unknown:
+        raise ConfigError(f"Unknown configuration fields: {', '.join(sorted(unknown))}")
     return values
+
+
+def _interval(value: object, label: str, minimum: int, allow_zero: bool = False) -> int:
+    if isinstance(value, str) and re.fullmatch(r"[0-9]+", value):
+        value = int(value)
+    if type(value) is not int or (value < minimum and not (allow_zero and value == 0)):
+        allowed = f"0 or at least {minimum}" if allow_zero else f"at least {minimum}"
+        raise ConfigError(f"{label} must be an integer {allowed}")
+    return value
 
 
 def _text(value: object, label: str) -> str:
@@ -86,6 +106,17 @@ def _ssh_host(value: object, label: str) -> str:
     return host
 
 
+def _paths(value: object, label: str) -> tuple[str, ...]:
+    if not isinstance(value, list):
+        raise ConfigError(f"{label} must be an array of absolute remote paths")
+    paths = tuple(_text(path, label) for path in value)
+    if any(not path.startswith("/") for path in paths):
+        raise ConfigError(f"{label} must contain absolute remote paths (no ~ expansion)")
+    if len(set(paths)) != len(paths):
+        raise ConfigError(f"{label} contains duplicate paths")
+    return paths
+
+
 def _identity(value: object, label: str, base: Path) -> Path:
     name = _text(value, label)
     path = Path(name).expanduser()
@@ -98,61 +129,40 @@ def _identity(value: object, label: str, base: Path) -> Path:
 
 
 def load_settings(
-    env_file: Path = Path(".env"), environ: Mapping[str, str] | None = None
+    config_file: Path = Path("env.yml"), environ: Mapping[str, str] | None = None
 ) -> Settings:
-    """Read documented .env values, with process environment taking precedence."""
-    env_file = env_file.expanduser().resolve()
-    values = _read_env_file(env_file)
-    values.update(os.environ if environ is None else environ)
-    if not env_file.exists() and not values.get("GPU_TRACKER_TARGETS"):
-        raise ConfigError(f"No configuration found. Copy .env.example to {env_file} and edit it")
+    """Read YAML values, with explicitly set process environment taking precedence."""
+    config_file = config_file.expanduser().resolve()
+    values = _read_yaml_file(config_file)
+    environment = os.environ if environ is None else environ
+    for variable, field in _ENV_FIELDS.items():
+        if variable in environment:
+            value = environment[variable]
+            if field == "targets":
+                try:
+                    value = json.loads(value)
+                except json.JSONDecodeError as exc:
+                    raise ConfigError(f"{variable} must be JSON: {exc.msg}") from exc
+            values[field] = value
+    if not config_file.exists() and "targets" not in values:
+        raise ConfigError(f"No configuration found. Copy env.example.yml to {config_file} and edit it")
 
-    user = _text(values.get("GPU_TRACKER_SSH_USER"), "GPU_TRACKER_SSH_USER")
+    user = _text(values.get("ssh_user"), "ssh_user")
     if not _USERNAME.fullmatch(user):
-        raise ConfigError("GPU_TRACKER_SSH_USER is not a valid SSH username")
-    identity = _identity(
-        values.get("GPU_TRACKER_SSH_KEY"), "GPU_TRACKER_SSH_KEY", env_file.parent
-    )
+        raise ConfigError("ssh_user is not a valid SSH username")
+    identity = _identity(values.get("ssh_key"), "ssh_key", config_file.parent)
 
-    raw_targets = values.get("GPU_TRACKER_TARGETS")
-    if not raw_targets:
-        raise ConfigError("Set GPU_TRACKER_TARGETS in .env (see .env.example)")
-    try:
-        target_data = json.loads(raw_targets)
-    except json.JSONDecodeError as exc:
-        raise ConfigError(f"GPU_TRACKER_TARGETS must be JSON: {exc.msg}") from exc
+    target_data = values.get("targets")
     if not isinstance(target_data, list) or not target_data:
-        raise ConfigError("GPU_TRACKER_TARGETS must be a nonempty JSON array")
-
-    try:
-        project_data = json.loads(values.get("GPU_TRACKER_PROJECT_DIRS", "{}"))
-    except json.JSONDecodeError as exc:
-        raise ConfigError(f"GPU_TRACKER_PROJECT_DIRS must be JSON: {exc.msg}") from exc
-    if not isinstance(project_data, dict):
-        raise ConfigError("GPU_TRACKER_PROJECT_DIRS must be a JSON object")
-    project_dirs: dict[str, tuple[str, ...]] = {}
-    for cluster, directories in project_data.items():
-        label = f"GPU_TRACKER_PROJECT_DIRS[{cluster!r}]"
-        if not isinstance(cluster, str) or not cluster.strip():
-            raise ConfigError("GPU_TRACKER_PROJECT_DIRS keys must be cluster names")
-        if not isinstance(directories, list):
-            raise ConfigError(f"{label} must be an array of absolute directories")
-        paths: list[str] = []
-        for directory in directories:
-            path = _text(directory, label)
-            if not path.startswith("/"):
-                raise ConfigError(f"{label} must contain absolute POSIX paths")
-            if path not in paths:
-                paths.append(path)
-        project_dirs[cluster] = tuple(paths)
+        raise ConfigError("targets must be a nonempty YAML list")
 
     targets: list[Target] = []
     seen: set[tuple[str, str]] = set()
     for index, item in enumerate(target_data, 1):
-        label = f"GPU_TRACKER_TARGETS[{index}]"
+        label = f"targets[{index}]"
         if not isinstance(item, dict):
             raise ConfigError(f"{label} must be an object")
-        unknown = set(item) - {"cluster", "name", "host", "user", "identity_file", "port"}
+        unknown = set(item) - {"cluster", "name", "host", "user", "identity_file", "port", "disk_paths", "folder_paths"}
         if unknown:
             raise ConfigError(f"{label} has unknown fields: {', '.join(sorted(unknown))}")
         cluster = _text(item.get("cluster"), f"{label}.cluster")
@@ -162,7 +172,7 @@ def load_settings(
         if not _USERNAME.fullmatch(target_user):
             raise ConfigError(f"{label}.user is not a valid SSH username")
         target_identity = _identity(
-            item.get("identity_file", str(identity)), f"{label}.identity_file", env_file.parent
+            item.get("identity_file", str(identity)), f"{label}.identity_file", config_file.parent
         )
         port = item.get("port", 22)
         if type(port) is not int or not 1 <= port <= 65535:
@@ -172,20 +182,11 @@ def load_settings(
             raise ConfigError(f"Duplicate target {cluster}/{name}")
         seen.add(key)
         targets.append(
-            Target(cluster, name, host, target_user, target_identity, port, project_dirs.get(cluster, ()))
+            Target(cluster, name, host, target_user, target_identity, port,
+                   _paths(item.get("disk_paths", []), f"{label}.disk_paths"),
+                   _paths(item.get("folder_paths", []), f"{label}.folder_paths"))
         )
 
-    unknown_clusters = set(project_dirs) - {target.cluster for target in targets}
-    if unknown_clusters:
-        raise ConfigError(
-            f"GPU_TRACKER_PROJECT_DIRS has unknown clusters: {', '.join(sorted(unknown_clusters))}"
-        )
-
-    refresh_value = values.get("GPU_TRACKER_REFRESH_SECONDS", "0")
-    try:
-        refresh_seconds = int(refresh_value)
-    except (TypeError, ValueError) as exc:
-        raise ConfigError("GPU_TRACKER_REFRESH_SECONDS must be 0 or at least 10") from exc
-    if refresh_seconds != 0 and refresh_seconds < 10:
-        raise ConfigError("GPU_TRACKER_REFRESH_SECONDS must be 0 or at least 10")
-    return Settings(tuple(targets), refresh_seconds)
+    refresh_seconds = _interval(values.get("refresh_seconds", 0), "refresh_seconds", 10, allow_zero=True)
+    folder_refresh_seconds = _interval(values.get("folder_refresh_seconds", 300), "folder_refresh_seconds", 60)
+    return Settings(tuple(targets), refresh_seconds, folder_refresh_seconds)

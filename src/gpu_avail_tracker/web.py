@@ -1,4 +1,4 @@
-"""Local HTTP dashboard for GPU and checkpoint snapshots."""
+"""Local HTTP dashboard for GPU snapshots."""
 
 from __future__ import annotations
 
@@ -6,28 +6,42 @@ import asyncio
 import json
 import os
 import threading
-from dataclasses import dataclass
+import time
+from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
-from pathlib import PurePosixPath
 from urllib.parse import urlsplit
 
 from .config import Settings, Target
-from .probe import ProbeError, ProjectSnapshot, Snapshot, query_project_files, query_target
+from .probe import ProbeError, Snapshot, StorageUsage, query_storage, query_target
+
+
+@dataclass
+class StorageState:
+    usage: StorageUsage | None = None
+    checked_at: datetime | None = None
+    attempted_at: datetime | None = None
+    attempted_monotonic: float | None = None
+    error: str | None = None
 
 
 @dataclass
 class HostState:
     snapshot: Snapshot | None = None
     error: str | None = None
-    projects: ProjectSnapshot | None = None
-    project_error: str | None = None
+    storage: dict[tuple[str, str], StorageState] = field(default_factory=dict)
 
 
 class Dashboard:
     def __init__(self, settings: Settings) -> None:
         self.settings = settings
         self.states = {target.key: HostState() for target in settings.targets}
+        for target in settings.targets:
+            self.states[target.key].storage = {
+                (kind, path): StorageState()
+                for kind, paths in (("disk", target.disk_paths), ("folder", target.folder_paths))
+                for path in paths
+            }
         self.last_refresh_at: datetime | None = None
         self.refreshing = False
         self._lock = threading.Lock()
@@ -71,34 +85,42 @@ class Dashboard:
     async def _refresh(self) -> None:
         semaphore = asyncio.Semaphore(4)
 
-        async def fetch(kind: str, target: Target) -> tuple[str, Target, Snapshot | ProjectSnapshot | None, str | None]:
+        async def fetch(target: Target) -> None:
             async with semaphore:
                 try:
-                    if kind == "gpu":
-                        return kind, target, await query_target(target), None
-                    return kind, target, await query_project_files(target), None
+                    snapshot = await query_target(target)
                 except ProbeError as exc:
-                    return kind, target, None, str(exc)
+                    with self._lock:
+                        self.states[target.key].error = str(exc)
+                else:
+                    with self._lock:
+                        state = self.states[target.key]
+                        state.snapshot, state.error = snapshot, None
 
-        tasks = [asyncio.create_task(fetch("gpu", target)) for target in self.settings.targets]
-        tasks.extend(
-            asyncio.create_task(fetch("files", target))
-            for target in self.settings.targets if target.project_dirs
-        )
-        try:
-            for task in asyncio.as_completed(tasks):
-                kind, target, result, error = await task
+        async def fetch_storage(target: Target, kind: str, path: str) -> None:
+            async with semaphore:
+                try:
+                    usage = await query_storage(target, kind, path)
+                    error = None
+                except ProbeError as exc:
+                    usage, error = None, str(exc)
                 with self._lock:
-                    state = self.states[target.key]
-                    if kind == "gpu":
-                        if isinstance(result, Snapshot):
-                            state.snapshot, state.error = result, None
-                        else:
-                            state.error = error or "Query failed"
-                    elif isinstance(result, ProjectSnapshot):
-                        state.projects, state.project_error = result, None
-                    else:
-                        state.project_error = error or "Scan failed"
+                    state = self.states[target.key].storage[kind, path]
+                    state.attempted_at = datetime.now(timezone.utc)
+                    state.attempted_monotonic = time.monotonic()
+                    state.error = error
+                    if usage is not None:
+                        state.usage, state.checked_at = usage, state.attempted_at
+
+        tasks = [asyncio.create_task(fetch(target)) for target in self.settings.targets]
+        for target in self.settings.targets:
+            for (kind, path), state in self.states[target.key].storage.items():
+                if (kind == "folder" and state.attempted_monotonic is not None
+                        and time.monotonic() - state.attempted_monotonic < self.settings.folder_refresh_seconds):
+                    continue
+                tasks.append(asyncio.create_task(fetch_storage(target, kind, path)))
+        try:
+            await asyncio.gather(*tasks)
         finally:
             for task in tasks:
                 if not task.done():
@@ -108,27 +130,34 @@ class Dashboard:
     def payload(self) -> dict:
         with self._lock:
             hosts = []
-            idle = busy = unknown = checkpoints = 0
+            idle = busy = unknown = 0
             for target in self.settings.targets:
                 state = self.states[target.key]
                 snapshot = state.snapshot
-                projects = state.projects
                 if snapshot is None or state.error:
                     unknown += 1
                 else:
                     idle += sum(not gpu.processes for gpu in snapshot.gpus)
                     busy += sum(bool(gpu.processes) for gpu in snapshot.gpus)
-                if projects:
-                    checkpoints += len(projects.files)
                 hosts.append({
                     "cluster": target.cluster,
                     "name": target.name,
                     "host": target.host,
                     "gpu_error": state.error,
-                    "project_error": state.project_error,
                     "gpu_checked_at": snapshot.checked_at.isoformat() if snapshot else None,
-                    "project_checked_at": projects.checked_at.isoformat() if projects else None,
-                    "project_dirs": target.project_dirs,
+                    "memory_total_kib": snapshot.memory_total_kib if snapshot else None,
+                    "memory_available_kib": snapshot.memory_available_kib if snapshot else None,
+                    "storage": [
+                        {
+                            "kind": kind, "path": path, "error": reading.error,
+                            "checked_at": reading.checked_at.isoformat() if reading.checked_at else None,
+                            "attempted_at": reading.attempted_at.isoformat() if reading.attempted_at else None,
+                            "used_kib": reading.usage.used_kib if reading.usage else None,
+                            "total_kib": reading.usage.total_kib if reading.usage else None,
+                            "available_kib": reading.usage.available_kib if reading.usage else None,
+                        }
+                        for (kind, path), reading in state.storage.items()
+                    ],
                     "gpus": [
                         {
                             "index": gpu.index,
@@ -136,33 +165,26 @@ class Dashboard:
                             "name": gpu.name,
                             "memory_total_mib": gpu.memory_total_mib,
                             "memory_used_mib": gpu.memory_used_mib,
+                            "utilization_percent": gpu.utilization_percent,
                             "processes": [
                                 {
                                     "pid": process.pid,
                                     "name": process.name,
                                     "user": process.user,
                                     "used_memory_mib": process.memory_mib,
+                                    "elapsed_seconds": process.elapsed_seconds,
                                 }
                                 for process in gpu.processes
                             ],
                         }
                         for gpu in snapshot.gpus
                     ] if snapshot else [],
-                    "files": [
-                        {
-                            "name": PurePosixPath(file.path).name,
-                            "path": file.path,
-                            "size_bytes": file.size_bytes,
-                            "modified_at": file.modified_at.isoformat(),
-                        }
-                        for file in projects.files
-                    ] if projects else [],
                 })
             return {
                 "hosts": hosts,
                 "summary": {
                     "idle": idle, "busy": busy, "unknown_hosts": unknown,
-                    "checkpoints": checkpoints, "total_hosts": len(hosts),
+                    "total_hosts": len(hosts),
                 },
                 "refreshing": self.refreshing,
                 "refresh_seconds": self.settings.refresh_seconds,

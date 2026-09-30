@@ -5,8 +5,8 @@ from __future__ import annotations
 import asyncio
 import csv
 import io
-import math
 import re
+import shlex
 from dataclasses import dataclass
 from datetime import datetime, timezone
 
@@ -23,6 +23,7 @@ class GpuProcess:
     name: str
     user: str | None
     memory_mib: int | None
+    elapsed_seconds: int | None = None
 
 
 @dataclass(frozen=True)
@@ -33,6 +34,7 @@ class Gpu:
     memory_total_mib: int | None
     memory_used_mib: int | None
     processes: tuple[GpuProcess, ...]
+    utilization_percent: int | None = None
 
 
 @dataclass(frozen=True)
@@ -40,57 +42,35 @@ class Snapshot:
     target: Target
     gpus: tuple[Gpu, ...]
     checked_at: datetime
+    memory_total_kib: int | None = None
+    memory_available_kib: int | None = None
 
 
-@dataclass(frozen=True)
-class Checkpoint:
-    path: str
-    size_bytes: int
-    modified_at: datetime
-
-
-@dataclass(frozen=True)
-class ProjectSnapshot:
-    files: tuple[Checkpoint, ...]
-    checked_at: datetime
-
-
-# The script is constant: configuration values are SSH argv entries, never shell code.
+# GPU probe is constant; storage paths below are shell-quoted literal arguments.
 # Length-prefixed blocks keep process names from masquerading as protocol delimiters.
 REMOTE_SCRIPT = """set -eu
 export LC_ALL=C
-gpus="$(nvidia-smi --query-gpu=index,uuid,name,memory.total,memory.used --format=csv,noheader,nounits)"
+gpus="$(nvidia-smi --query-gpu=index,uuid,name,memory.total,memory.used,utilization.gpu --format=csv,noheader,nounits)"
 apps="$(nvidia-smi --query-compute-apps=gpu_uuid,pid,process_name,used_gpu_memory --format=csv,noheader,nounits)"
-owners="$(ps -eo pid=,user:64=)"
-printf 'GPU_AVAIL_V1\\n'
-for block in "$gpus" "$apps" "$owners"; do
+owners="$(ps -eo pid=,user:64=,etimes= 2>/dev/null || ps -eo pid=,user:64=)"
+memory="$(cat /proc/meminfo 2>/dev/null || true)"
+printf 'GPU_AVAIL_V2\\n'
+for block in "$gpus" "$apps" "$owners" "$memory"; do
     length="$(printf '%s' "$block" | wc -c)"
     printf '%s\\n' "$length"
     printf '%s' "$block"
 done
 """
 
-REMOTE_FILES_SCRIPT = """set -eu
-export LC_ALL=C
-printf 'CHECKPOINTS_V1\\0'
-while IFS= read -r directory; do
-    find "$directory" -type f \\( -iname '*.ckpt' -o -iname '*.pt' -o -iname '*.pth' \\
-        -o -iname '*.bin' -o -iname '*.safetensors' -o -iname '*.onnx' \\
-        -o -iname '*.h5' -o -iname '*.hdf5' -o -iname '*.gguf' \\
-        -o -iname '*.weights' \\) -printf '%p\\0%s\\0%T@\\0'
-done <<'END_PROJECT_DIRS'
-"""
-
-
-def _blocks(payload: bytes) -> tuple[str, str, str]:
+def _blocks(payload: bytes) -> tuple[str, ...]:
     if len(payload) > 2_000_000:
         raise ProbeError("SSH response is too large")
-    prefix = b"GPU_AVAIL_V1\n"
+    prefix = b"GPU_AVAIL_V2\n"
     if not payload.startswith(prefix):
         raise ProbeError("SSH response has an invalid header")
     position = len(prefix)
     blocks: list[str] = []
-    for _ in range(3):
+    for _ in range(4):
         end = payload.find(b"\n", position)
         if end < 0 or end - position > 12:
             raise ProbeError("SSH response has an invalid block length")
@@ -107,7 +87,7 @@ def _blocks(payload: bytes) -> tuple[str, str, str]:
         position += size
     if position != len(payload):
         raise ProbeError("SSH response has extra data")
-    return blocks[0], blocks[1], blocks[2]
+    return tuple(blocks)
 
 
 def _csv_rows(data: str, expected_fields: int, label: str) -> list[list[str]]:
@@ -134,18 +114,18 @@ def _integer(value: str, label: str, *, optional: bool = False) -> int | None:
 
 def parse_snapshot(payload: bytes, target: Target) -> Snapshot:
     """Only a complete, valid response becomes an availability snapshot."""
-    gpu_csv, app_csv, owner_text = _blocks(payload)
-    owners: dict[int, str] = {}
+    gpu_csv, app_csv, owner_text, memory_text = _blocks(payload)
+    owners: dict[int, tuple[str, int | None]] = {}
     for line in owner_text.splitlines():
-        fields = line.split(maxsplit=1)
-        if len(fields) != 2 or not fields[0].isdigit():
+        fields = line.split()
+        if len(fields) not in (2, 3) or not fields[0].isdigit():
             raise ProbeError("Invalid process owner output")
-        owners[int(fields[0])] = fields[1]
+        owners[int(fields[0])] = (fields[1], _integer(fields[2], "process age") if len(fields) == 3 else None)
 
-    gpu_rows = _csv_rows(gpu_csv, 5, "GPU")
+    gpu_rows = _csv_rows(gpu_csv, 6, "GPU")
     if not gpu_rows:
         raise ProbeError("No GPUs were returned by nvidia-smi")
-    gpu_info: dict[str, tuple[int, str, int | None, int | None]] = {}
+    gpu_info: dict[str, tuple[int, str, int | None, int | None, int | None]] = {}
     indices: set[int] = set()
     for row in gpu_rows:
         index = _integer(row[0], "GPU index")
@@ -155,11 +135,15 @@ def parse_snapshot(payload: bytes, target: Target) -> Snapshot:
         if not uuid.startswith("GPU-") or not name or uuid in gpu_info or index in indices:
             raise ProbeError("Invalid or duplicate GPU identity")
         indices.add(index)
+        utilization = _integer(row[5], "GPU utilization", optional=True)
+        if utilization is not None and utilization > 100:
+            raise ProbeError("Invalid GPU utilization: exceeds 100")
         gpu_info[uuid] = (
             index,
             name,
             _integer(row[3], "GPU total memory", optional=True),
             _integer(row[4], "GPU used memory", optional=True),
+            utilization,
         )
 
     apps: dict[str, list[GpuProcess]] = {uuid: [] for uuid in gpu_info}
@@ -174,15 +158,57 @@ def parse_snapshot(payload: bytes, target: Target) -> Snapshot:
         name = row[2].strip()
         if not name:
             raise ProbeError("Compute process has no name")
-        apps[uuid].append(
-            GpuProcess(pid, name, owners.get(pid), _integer(row[3], "process memory", optional=True))
-        )
+        user, elapsed = owners.get(pid, (None, None))
+        apps[uuid].append(GpuProcess(pid, name, user, _integer(row[3], "process memory", optional=True), elapsed))
 
     gpus = tuple(
-        Gpu(index, uuid, name, total, used, tuple(apps[uuid]))
-        for uuid, (index, name, total, used) in sorted(gpu_info.items(), key=lambda item: item[1][0])
+        Gpu(index, uuid, name, total, used, tuple(apps[uuid]), utilization)
+        for uuid, (index, name, total, used, utilization) in sorted(gpu_info.items(), key=lambda item: item[1][0])
     )
-    return Snapshot(target, gpus, datetime.now(timezone.utc))
+    memory = dict(re.findall(r"^(MemTotal|MemAvailable):\s+(\d+) kB$", memory_text, re.MULTILINE))
+    return Snapshot(target, gpus, datetime.now(timezone.utc),
+                    int(memory["MemTotal"]) if "MemTotal" in memory else None,
+                    int(memory["MemAvailable"]) if "MemAvailable" in memory else None)
+
+
+@dataclass(frozen=True)
+class StorageUsage:
+    used_kib: int
+    total_kib: int | None = None
+    available_kib: int | None = None
+
+
+def storage_script(kind: str, path: str) -> str:
+    """Bound remote work too, so a disconnected client does not leave du running."""
+    quoted = shlex.quote(path)
+    if kind == "disk":
+        command = f"timeout -k 1s 8s df -Pk -- {quoted}"
+    elif kind == "folder":
+        check = ('test -d "$1" || { echo "Path is not an accessible directory" >&2; exit 1; }; '
+                 'exec du -skx -- "$1"/.')
+        command = f"timeout -k 1s 15s sh -c {shlex.quote(check)} sh {quoted}"
+    else:
+        raise ValueError(f"Unknown storage kind: {kind}")
+    return f"export LC_ALL=C\n{command}\n"
+
+
+async def query_storage(target: Target, kind: str, path: str, *, ssh_binary: str = "ssh") -> StorageUsage:
+    payload = await _run_ssh(target, storage_script(kind, path).encode(), ssh_binary, 22)
+    lines = payload.decode("utf-8", "replace").strip().splitlines()
+    if kind == "folder":
+        if len(lines) != 1:
+            raise ProbeError("Invalid folder size output")
+        used = _integer(lines[0].split(maxsplit=1)[0], "folder size")
+        assert used is not None
+        return StorageUsage(used)
+    # Parse from the numeric columns, allowing whitespace in the filesystem name.
+    if len(lines) != 2:
+        raise ProbeError("Invalid filesystem output")
+    match = re.fullmatch(r".+?\s+(\d+)\s+(\d+)\s+(\d+)\s+\d+%\s+.+", lines[1])
+    if match is None:
+        raise ProbeError("Invalid filesystem output")
+    total, used, available = map(int, match.groups())
+    return StorageUsage(used, total, available)
 
 
 def _error_text(stderr: bytes) -> str:
@@ -190,31 +216,6 @@ def _error_text(stderr: bytes) -> str:
     first = message[0] if message else "remote command failed"
     first = re.sub(r"[\x00-\x1f\x7f-\x9f]", "", first)
     return first[:180]
-
-
-def parse_project_files(payload: bytes, target: Target) -> ProjectSnapshot:
-    if len(payload) > 16_000_000 or not payload.startswith(b"CHECKPOINTS_V1\0"):
-        raise ProbeError("Invalid checkpoint response")
-    records = payload[len(b"CHECKPOINTS_V1\0"):].split(b"\0")
-    if records[-1] != b"" or (len(records) - 1) % 3:
-        raise ProbeError("Incomplete checkpoint response")
-    files: dict[str, Checkpoint] = {}
-    for offset in range(0, len(records) - 1, 3):
-        path = records[offset].decode("utf-8", "replace")
-        try:
-            size = int(records[offset + 1])
-            timestamp = float(records[offset + 2])
-            if size < 0 or not math.isfinite(timestamp):
-                raise ValueError
-            modified_at = datetime.fromtimestamp(timestamp, timezone.utc)
-        except (ValueError, OverflowError, OSError) as exc:
-            raise ProbeError("Invalid checkpoint metadata") from exc
-        if not path.startswith("/") or not any(
-            path.startswith(directory.rstrip("/") + "/") for directory in target.project_dirs
-        ):
-            raise ProbeError("Checkpoint path is outside configured directories")
-        files[path] = Checkpoint(path, size, modified_at)
-    return ProjectSnapshot(tuple(sorted(files.values(), key=lambda file: file.path)), datetime.now(timezone.utc))
 
 
 def _ssh_command(target: Target, ssh_binary: str) -> list[str]:
@@ -254,20 +255,10 @@ async def _run_ssh(target: Target, script: bytes, ssh_binary: str, timeout_secon
             raise
         raise ProbeError(f"SSH query timed out after {timeout_seconds:g}s") from exc
     if process.returncode != 0:
+        if process.returncode in (124, 137):
+            raise ProbeError("Remote storage check timed out")
         raise ProbeError(_error_text(stderr))
     return stdout
-
-
-async def query_project_files(
-    target: Target, *, ssh_binary: str = "ssh", timeout_seconds: float = 30
-) -> ProjectSnapshot:
-    """List checkpoint metadata below the configured directories on one host."""
-    if not target.project_dirs:
-        return ProjectSnapshot((), datetime.now(timezone.utc))
-    script = (
-        REMOTE_FILES_SCRIPT + "\n".join(target.project_dirs) + "\nEND_PROJECT_DIRS\n"
-    ).encode("utf-8")
-    return parse_project_files(await _run_ssh(target, script, ssh_binary, timeout_seconds), target)
 
 
 async def query_target(

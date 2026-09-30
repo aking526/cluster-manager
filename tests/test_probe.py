@@ -13,26 +13,27 @@ import subprocess
 from gpu_avail_tracker.config import Target
 from gpu_avail_tracker.probe import (
     ProbeError,
-    REMOTE_FILES_SCRIPT,
     REMOTE_SCRIPT,
-    parse_project_files,
     parse_snapshot,
-    query_project_files,
     query_target,
+    query_storage,
+    storage_script,
 )
 
 
 def frame(*blocks: str) -> bytes:
-    payload = b"GPU_AVAIL_V1\n"
+    payload = b"GPU_AVAIL_V2\n"
+    if len(blocks) == 3:
+        blocks = (*blocks, "MemTotal:       131072 kB\nMemAvailable:   65536 kB")
     for block in blocks:
         data = block.encode("utf-8")
         payload += str(len(data)).encode("ascii") + b"\n" + data
     return payload
 
 
-GPU_ROWS = "0, GPU-aaa, NVIDIA A100, 81920, 2048\n1, GPU-bbb, NVIDIA A100, 81920, 0"
+GPU_ROWS = "0, GPU-aaa, NVIDIA A100, 81920, 2048, 75\n1, GPU-bbb, NVIDIA A100, 81920, 0, N/A"
 APP_ROWS = 'GPU-aaa, 123, "python, trainer.py", 2000\nGPU-aaa, 456, python, 48'
-OWNER_ROWS = "123 alice\n456 bob\n999 root"
+OWNER_ROWS = "123 alice 13320\n456 bob 0\n999 root 86400"
 
 
 class ProbeParsingTests(unittest.TestCase):
@@ -45,11 +46,18 @@ class ProbeParsingTests(unittest.TestCase):
         self.assertEqual(snapshot.gpus[0].processes[0].name, "python, trainer.py")
         self.assertEqual(snapshot.gpus[0].processes[0].user, "alice")
         self.assertEqual(len(snapshot.gpus[1].processes), 0)
+        self.assertEqual(snapshot.gpus[0].processes[0].elapsed_seconds, 13320)
+        self.assertEqual(snapshot.gpus[0].processes[1].elapsed_seconds, 0)
+        self.assertEqual(snapshot.gpus[0].utilization_percent, 75)
+        self.assertIsNone(snapshot.gpus[1].utilization_percent)
+        self.assertEqual(snapshot.memory_available_kib, 65536)
+        self.assertEqual(snapshot.memory_total_kib, 131072)
 
     def test_missing_owner_does_not_make_busy_gpu_idle(self) -> None:
         snapshot = parse_snapshot(frame(GPU_ROWS, APP_ROWS, ""), self.target)
         self.assertEqual(len(snapshot.gpus[0].processes), 2)
         self.assertIsNone(snapshot.gpus[0].processes[0].user)
+        self.assertIsNone(snapshot.gpus[0].processes[0].elapsed_seconds)
 
     def test_partial_and_malformed_data_are_not_snapshots(self) -> None:
         with self.assertRaisesRegex(ProbeError, "ended early"):
@@ -61,6 +69,50 @@ class ProbeParsingTests(unittest.TestCase):
         with self.assertRaisesRegex(ProbeError, "unknown GPU"):
             parse_snapshot(frame(GPU_ROWS, "GPU-other, 123, python, 200", OWNER_ROWS), self.target)
 
+    def test_optional_memory_and_age_are_not_required(self) -> None:
+        snapshot = parse_snapshot(frame(GPU_ROWS, APP_ROWS, "123 alice", ""), self.target)
+        self.assertIsNone(snapshot.memory_available_kib)
+        self.assertIsNone(snapshot.gpus[0].processes[0].elapsed_seconds)
+
+    def test_invalid_utilization_and_age_are_rejected(self) -> None:
+        with self.assertRaisesRegex(ProbeError, "utilization"):
+            parse_snapshot(frame(GPU_ROWS.replace(", 75", ", 101"), APP_ROWS, OWNER_ROWS), self.target)
+        with self.assertRaisesRegex(ProbeError, "process age"):
+            parse_snapshot(frame(GPU_ROWS, APP_ROWS, "123 alice -1"), self.target)
+
+    def test_storage_paths_remain_literal_shell_arguments(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            marker = root / "injected"
+            path = f"/data/it's a folder; $(touch {marker}) `touch {marker}`"
+            timeout = root / "timeout"
+            timeout.write_text("#!/bin/sh\nprintf '%s\\n' \"$@\"\n")
+            timeout.chmod(0o755)
+            result = subprocess.run(["sh", "-s"], input=storage_script("disk", path),
+                                    text=True, capture_output=True, check=True,
+                                    env={**os.environ, "PATH": f"{root}:{os.environ['PATH']}"})
+            self.assertEqual(result.stdout.splitlines()[-1], path)
+            self.assertFalse(marker.exists())
+
+    def test_folder_scan_uses_same_filesystem_and_timeout(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            folder = root / "a folder's name"
+            folder.mkdir()
+            timeout = root / "timeout"
+            timeout.write_text('#!/bin/sh\nshift 3\nexec "$@"\n')
+            timeout.chmod(0o755)
+            result = subprocess.run(["sh", "-s"], input=storage_script("folder", str(folder)),
+                                    text=True, capture_output=True, check=True,
+                                    env={**os.environ, "PATH": f"{root}:{os.environ['PATH']}"})
+            self.assertTrue(result.stdout.split()[0].isdigit())
+            self.assertIn("timeout -k 1s 15s sh -c", storage_script("folder", str(folder)))
+            missing = subprocess.run(["sh", "-s"], input=storage_script("folder", str(root / "missing")),
+                                     text=True, capture_output=True,
+                                     env={**os.environ, "PATH": f"{root}:{os.environ['PATH']}"})
+            self.assertNotEqual(missing.returncode, 0)
+            self.assertIn("not an accessible directory", missing.stderr)
+
     def test_remote_shell_script_and_framing(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
@@ -68,7 +120,7 @@ class ProbeParsingTests(unittest.TestCase):
             nvidia.write_text(
                 "#!/bin/sh\n"
                 "case \"$1\" in\n"
-                "  --query-gpu=*) printf '%s\\n' '0, GPU-aaa, NVIDIA A100, 81920, 2048' ;;\n"
+                "  --query-gpu=*) printf '%s\\n' '0, GPU-aaa, NVIDIA A100, 81920, 2048, 75' ;;\n"
                 "  --query-compute-apps=*) printf '%s\\n' 'GPU-aaa, 123, python, 2000' ;;\n"
                 "  *) exit 2 ;;\n"
                 "esac\n",
@@ -76,7 +128,7 @@ class ProbeParsingTests(unittest.TestCase):
             )
             nvidia.chmod(0o755)
             ps = root / "ps"
-            ps.write_text("#!/bin/sh\nprintf '%s\\n' '123 alice'\n", encoding="utf-8")
+            ps.write_text("#!/bin/sh\nprintf '%s\\n' '123 alice 13320'\n", encoding="utf-8")
             ps.chmod(0o755)
             result = subprocess.run(
                 ["sh", "-s"],
@@ -89,33 +141,6 @@ class ProbeParsingTests(unittest.TestCase):
             snapshot = parse_snapshot(result.stdout, self.target)
             self.assertEqual(snapshot.gpus[0].processes[0].user, "alice")
 
-    def test_remote_checkpoint_scan_recurses_and_reports_metadata(self) -> None:
-        with tempfile.TemporaryDirectory() as directory:
-            root = Path(directory) / "model $(echo injected)"
-            nested = root / "run 1"
-            nested.mkdir(parents=True)
-            (nested / "weights.SAFETENSORS").write_bytes(b"weights")
-            (nested / "notes.txt").write_text("ignore", encoding="utf-8")
-            target = Target("lab", "gpu01", "gpu.example", "alice", Path("/tmp/key"), project_dirs=(str(root),))
-            result = subprocess.run(
-                ["sh", "-s"],
-                input=(REMOTE_FILES_SCRIPT + str(root) + "\nEND_PROJECT_DIRS\n").encode("utf-8"),
-                capture_output=True,
-                check=True,
-            )
-            snapshot = parse_project_files(result.stdout, target)
-            self.assertEqual([file.path for file in snapshot.files], [str(nested / "weights.SAFETENSORS")])
-            self.assertEqual(snapshot.files[0].size_bytes, 7)
-
-    def test_invalid_checkpoint_response_is_rejected(self) -> None:
-        target = Target("lab", "gpu", "gpu.example", "alice", Path("/tmp/key"), project_dirs=("/work",))
-        for payload, error in (
-            (b"CHECKPOINTS_V1\0/work/a.pt\0", "Incomplete"),
-            (b"CHECKPOINTS_V1\0/elsewhere/a.pt\0" b"1\0" b"1.0\0", "outside"),
-            (b"CHECKPOINTS_V1\0/work/a.pt\0" b"-1\0" b"1.0\0", "metadata"),
-        ):
-            with self.subTest(payload=payload), self.assertRaisesRegex(ProbeError, error):
-                parse_project_files(payload, target)
 
 
 class FakeSshTests(unittest.IsolatedAsyncioTestCase):
@@ -168,28 +193,22 @@ class FakeSshTests(unittest.IsolatedAsyncioTestCase):
             with self.assertRaisesRegex(ProbeError, "Permission denied"):
                 await query_target(self.target, ssh_binary=str(self.ssh))
 
+    async def test_storage_readings_and_malformed_output(self) -> None:
+        for kind, payload, expected in (
+            ("disk", "Filesystem 1024-blocks Used Available Capacity Mounted on\n/dev/my disk 1000 200 750 22% /data path\n", (200, 1000, 750)),
+            ("folder", "4096\t/data/my folder\n", (4096, None, None)),
+        ):
+            with self.subTest(kind=kind), patch.dict(os.environ, {
+                **self.base_env, "FAKE_PAYLOAD": base64.b64encode(payload.encode()).decode(),
+            }):
+                usage = await query_storage(self.target, kind, "/data/my folder", ssh_binary=str(self.ssh))
+                self.assertEqual((usage.used_kib, usage.total_kib, usage.available_kib), expected)
+        for kind in ("disk", "folder"):
+            with patch.dict(os.environ, {**self.base_env, "FAKE_PAYLOAD": ""}):
+                with self.assertRaises(ProbeError):
+                    await query_storage(self.target, kind, "/missing", ssh_binary=str(self.ssh))
+
     async def test_timeout_is_reported(self) -> None:
         with patch.dict(os.environ, {**self.base_env, "FAKE_SLEEP": "1"}):
             with self.assertRaisesRegex(ProbeError, "timed out"):
                 await query_target(self.target, ssh_binary=str(self.ssh), timeout_seconds=0.05)
-
-    async def test_project_paths_are_sent_as_data_to_ssh(self) -> None:
-        target = Target(
-            "lab", "gpu01", "gpu.example", "alice", self.key, 2222,
-            ("/work/my project", "/work/$(touch /tmp/never-run)"),
-        )
-        payload = b"CHECKPOINTS_V1\0/work/my project/run/checkpoint.pt\0" b"123\0" b"1790000000.0\0"
-        with patch.dict(os.environ, {**self.base_env, "FAKE_PAYLOAD": base64.b64encode(payload).decode()}):
-            snapshot = await query_project_files(target, ssh_binary=str(self.ssh))
-        self.assertEqual(snapshot.files[0].size_bytes, 123)
-        script = self.script_file.read_text(encoding="utf-8")
-        self.assertIn('find "$directory"', script)
-        self.assertTrue(script.endswith("/work/my project\n/work/$(touch /tmp/never-run)\nEND_PROJECT_DIRS\n"))
-
-    async def test_project_scan_error_is_reported(self) -> None:
-        target = Target(
-            "lab", "gpu01", "gpu.example", "alice", self.key, 2222, ("/missing",)
-        )
-        with patch.dict(os.environ, {**self.base_env, "FAKE_FAIL": "1"}):
-            with self.assertRaisesRegex(ProbeError, "Permission denied"):
-                await query_project_files(target, ssh_binary=str(self.ssh))

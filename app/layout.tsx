@@ -3,7 +3,7 @@ import "./globals.css";
 
 export const metadata: Metadata = {
   title: "Cluster Manager — GPU overview",
-  description: "Local GPU fleet and project checkpoint dashboard",
+  description: "Local GPU fleet and process dashboard",
 };
 
 export default function RootLayout({ children }: Readonly<{ children: React.ReactNode }>) {
